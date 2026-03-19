@@ -5,14 +5,22 @@
 #include <climits>
 #include <cctype>
 #include <cstdlib>
+#include <thread>
+#include <conio.h>
 
 using namespace std;
 
 #define MAX_QUEUE 100000
 
+// ================= QUEUE ITEM =================
+struct QueueItem {
+    long long value;
+    int fileIndex;
+};
+
 // ================= SHARED DATA =================
 struct SharedData {
-    long long buffer[MAX_QUEUE];
+    QueueItem buffer[MAX_QUEUE];
     int head;
     int tail;
     bool done;
@@ -34,37 +42,32 @@ public:
     SafeQueue(HANDLE m, HANDLE s, SharedData* d)
         : mutex(m), sem(s), data(d) {}
 
-    void push(long long value)
+    void push(const QueueItem& item)
     {
         WaitForSingleObject(mutex, INFINITE);
-
-        data->buffer[data->tail] = value;
+        data->buffer[data->tail] = item;
         data->tail = (data->tail + 1) % MAX_QUEUE;
-
         ReleaseMutex(mutex);
         ReleaseSemaphore(sem, 1, NULL);
     }
 
-    bool pop(long long& value)
+    bool pop(QueueItem& item)
     {
         WaitForSingleObject(sem, INFINITE);
         WaitForSingleObject(mutex, INFINITE);
-
         if (data->head == data->tail && data->done)
         {
             ReleaseMutex(mutex);
             return false;
         }
-
-        value = data->buffer[data->head];
+        item = data->buffer[data->head];
         data->head = (data->head + 1) % MAX_QUEUE;
-
         ReleaseMutex(mutex);
         return true;
     }
 };
 
-// ================= PRIME =================
+// ================= PRIME ================
 bool isPrime(long long n)
 {
     if (n < 2) return false;
@@ -165,21 +168,31 @@ int runWorker(string mapName, string mutexName, string semName)
 
     SafeQueue queue(hMutex, hSem, data);
 
-    long long value;
+    // Find out how many files there are (from main, pass as argument or use filesProcessed)
+    int fileCount = data->filesProcessed;
+    vector<long long> fileMinPrimes(fileCount, LLONG_MAX);
+    vector<long long> fileMaxPrimes(fileCount, LLONG_MIN);
 
-    while (queue.pop(value))
+    QueueItem item;
+    while (queue.pop(item))
     {
-        if (isPrime(value))
+        if (isPrime(item.value))
         {
+            int idx = item.fileIndex;
+            if (idx >= 0 && idx < fileCount) {
+                if (item.value < fileMinPrimes[idx]) fileMinPrimes[idx] = item.value;
+                if (item.value > fileMaxPrimes[idx]) fileMaxPrimes[idx] = item.value;
+            }
             WaitForSingleObject(hMutex, INFINITE);
-
-            if (value < data->globalMin) data->globalMin = value;
-            if (value > data->globalMax) data->globalMax = value;
-
+            if (item.value < data->globalMin) data->globalMin = item.value;
+            if (item.value > data->globalMax) data->globalMax = item.value;
             ReleaseMutex(hMutex);
         }
     }
 
+    // Workers only update stats, do not print per-file results
+    // Remove per-file printing from worker
+    // (after queue processing loop)
     return 0;
 }
 
@@ -291,6 +304,9 @@ int main(int argc, char* argv[])
     cout << "Found " << txtFiles.size() << " txt files" << endl;
     cout << "Using " << workerCount << " workers" << endl;
 
+    long long overallMinPrime = LLONG_MAX;
+    long long overallMaxPrime = LLONG_MIN;
+
     // ================= START WORKERS =================
     vector<HANDLE> workers;
     for (int i = 0; i < workerCount; i++)
@@ -304,33 +320,53 @@ int main(int argc, char* argv[])
         workers.push_back(hWorker);
     }
 
-    long long overallMinPrime = LLONG_MAX;
-    long long overallMaxPrime = LLONG_MIN;
-
+    cout << "\nType '+' to add a worker, '-' to remove a worker, or 'q' to finish file processing." << endl;
     int fileIndex = 0;
+    bool quitRequested = false;
     for (const string& filePath : txtFiles)
     {
+        // Handle user input before processing each file
+        if (_kbhit()) {
+            string cmd;
+            getline(cin, cmd);
+            if (cmd == "+") {
+                HANDLE hWorker = spawnWorker();
+                if (hWorker) {
+                    workers.push_back(hWorker);
+                    cout << "Worker added. Total: " << workers.size() << endl;
+                    ReleaseSemaphore(hSem, 1, NULL);
+                } else {
+                    cout << "Failed to add worker." << endl;
+                }
+            } else if (cmd == "-") {
+                if (!workers.empty()) {
+                    HANDLE h = workers.back();
+                    TerminateProcess(h, 0);
+                    CloseHandle(h);
+                    workers.pop_back();
+                    cout << "Worker removed. Total: " << workers.size() << endl;
+                } else {
+                    cout << "No workers to remove." << endl;
+                }
+            } else if (cmd == "q") {
+                quitRequested = true;
+                break;
+            }
+        }
         fileIndex++;
-
         HANDLE hFile = CreateFileA(filePath.c_str(), GENERIC_READ,
             FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-
         if (hFile == INVALID_HANDLE_VALUE) continue;
-
         char buffer[1024];
         DWORD bytesRead;
         string content;
-
         while (ReadFile(hFile, buffer, sizeof(buffer), &bytesRead, NULL) && bytesRead > 0)
             content.append(buffer, bytesRead);
-
         CloseHandle(hFile);
-
         long long num = 0;
         bool reading = false;
         long long fileMinPrime = LLONG_MAX;
         long long fileMaxPrime = LLONG_MIN;
-
         for (char c : content)
         {
             if (isdigit((unsigned char)c))
@@ -340,48 +376,42 @@ int main(int argc, char* argv[])
             }
             else if (reading)
             {
-                queue.push(num);
-
+                queue.push({num, fileIndex});
                 if (isPrime(num))
                 {
                     if (num < fileMinPrime) fileMinPrime = num;
                     if (num > fileMaxPrime) fileMaxPrime = num;
                 }
-
                 num = 0;
                 reading = false;
             }
         }
-
         if (reading)
         {
-            queue.push(num);
-
+            queue.push({num, fileIndex});
             if (isPrime(num))
             {
                 if (num < fileMinPrime) fileMinPrime = num;
                 if (num > fileMaxPrime) fileMaxPrime = num;
             }
         }
-
+        cout << "[FILE " << fileIndex << "/" << txtFiles.size() << "] "
+                 << fileNameOnly(filePath);
         if (fileMinPrime == LLONG_MAX)
         {
-            cout << "[FILE " << fileIndex << "/" << txtFiles.size() << "] "
-                 << fileNameOnly(filePath) << " -> no primes found" << endl;
+            cout << " -> no primes found" << endl;
         }
         else
         {
-            cout << "[FILE " << fileIndex << "/" << txtFiles.size() << "] "
-                 << fileNameOnly(filePath) << " -> min prime: " << fileMinPrime
+            cout << " -> min prime: " << fileMinPrime
                  << ", max prime: " << fileMaxPrime << endl;
-
             if (fileMinPrime < overallMinPrime) overallMinPrime = fileMinPrime;
             if (fileMaxPrime > overallMaxPrime) overallMaxPrime = fileMaxPrime;
         }
-
         WaitForSingleObject(hMutex, INFINITE);
         data->filesProcessed++;
         ReleaseMutex(hMutex);
+        if (quitRequested) break;
     }
 
     // ================= FINISH =================
@@ -389,7 +419,7 @@ int main(int argc, char* argv[])
     data->done = true;
     ReleaseMutex(hMutex);
 
-    ReleaseSemaphore(hSem, workerCount, NULL);
+    ReleaseSemaphore(hSem, workers.size(), NULL);
 
     // ================= WAIT =================
     for (HANDLE h : workers)
