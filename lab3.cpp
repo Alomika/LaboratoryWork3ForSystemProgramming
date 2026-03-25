@@ -433,7 +433,7 @@ int main(int argc, char* argv[])
         CloseHandle(h);
     }
 
-    cout << "\nPer-file prime stats:" << endl;
+    cout << "\nPer-file prime numbers:" << endl;
     for (int i = 0; i < data->totalFiles; i++)
     {
         cout << "[FILE " << (i + 1) << "/" << data->totalFiles << "] "
@@ -445,12 +445,12 @@ int main(int argc, char* argv[])
         }
         else
         {
-            cout << " -> min prime: " << data->fileMinPrime[i]
-                 << ", max prime: " << data->fileMaxPrime[i] << endl;
+            cout << " -> min: " << data->fileMinPrime[i]
+                 << ", max: " << data->fileMaxPrime[i] << endl;
         }
     }
 
-    cout << "\nSummary for all files:" << endl;
+    cout << "\nSummary:" << endl;
     if (data->globalMin == LLONG_MAX)
     {
         cout << "No primes found" << endl;
