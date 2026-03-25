@@ -5,33 +5,35 @@
 #include <climits>
 #include <cctype>
 #include <cstdlib>
-#include <thread>
-#include <conio.h>
+#include <cstring>
 
 using namespace std;
 
 #define MAX_QUEUE 100000
+#define MAX_FILES 4096
+#define MAX_PATH_LEN 260
 
-// ================= QUEUE ITEM =================
 struct QueueItem {
-    long long value;
     int fileIndex;
 };
 
-// ================= SHARED DATA =================
 struct SharedData {
     QueueItem buffer[MAX_QUEUE];
     int head;
     int tail;
+    int count;
     bool done;
+
+    int totalFiles;
+
+    char filePaths[MAX_FILES][MAX_PATH_LEN];
+    long long fileMinPrime[MAX_FILES];
+    long long fileMaxPrime[MAX_FILES];
 
     long long globalMin;
     long long globalMax;
-
-    int filesProcessed;
 };
 
-// ================= SAFE QUEUE CLASS =================
 class SafeQueue {
 private:
     HANDLE mutex;
@@ -42,40 +44,61 @@ public:
     SafeQueue(HANDLE m, HANDLE s, SharedData* d)
         : mutex(m), sem(s), data(d) {}
 
-    void push(const QueueItem& item)
+    bool push(const QueueItem& item)
     {
         WaitForSingleObject(mutex, INFINITE);
+
+        if (data->count >= MAX_QUEUE)
+        {
+            ReleaseMutex(mutex);
+            return false;
+        }
+
         data->buffer[data->tail] = item;
         data->tail = (data->tail + 1) % MAX_QUEUE;
+        data->count++;
+
         ReleaseMutex(mutex);
         ReleaseSemaphore(sem, 1, NULL);
+        return true;
     }
 
     bool pop(QueueItem& item)
     {
         WaitForSingleObject(sem, INFINITE);
         WaitForSingleObject(mutex, INFINITE);
-        if (data->head == data->tail && data->done)
+
+        if (data->count == 0 && data->done)
         {
             ReleaseMutex(mutex);
             return false;
         }
+
+        if (data->count == 0)
+        {
+            ReleaseMutex(mutex);
+            return false;
+        }
+
         item = data->buffer[data->head];
         data->head = (data->head + 1) % MAX_QUEUE;
+        data->count--;
+
         ReleaseMutex(mutex);
         return true;
     }
 };
 
-// ================= PRIME ================
 bool isPrime(long long n)
 {
     if (n < 2) return false;
     if (n % 2 == 0) return n == 2;
 
     for (long long i = 3; i * i <= n; i += 2)
+    {
         if (n % i == 0)
             return false;
+    }
 
     return true;
 }
@@ -111,7 +134,8 @@ void collectTxtFilesRecursive(const string& dir, vector<string>& outFiles)
     if (hFind == INVALID_HANDLE_VALUE)
         return;
 
-    do {
+    do
+    {
         string name = fd.cFileName;
         if (name == "." || name == "..")
             continue;
@@ -134,32 +158,72 @@ void collectTxtFilesRecursive(const string& dir, vector<string>& outFiles)
     FindClose(hFind);
 }
 
-// ================= WORKER =================
-int runWorker(string mapName, string mutexName, string semName)
+bool processOneFile(const char* filePath, long long& minPrime, long long& maxPrime)
+{
+    HANDLE hFile = CreateFileA(filePath, GENERIC_READ,
+        FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
+    if (hFile == INVALID_HANDLE_VALUE)
+        return false;
+
+    string content;
+    char buffer[4096];
+    DWORD bytesRead = 0;
+    while (ReadFile(hFile, buffer, sizeof(buffer), &bytesRead, NULL) && bytesRead > 0)
+    {
+        content.append(buffer, bytesRead);
+    }
+    CloseHandle(hFile);
+
+    minPrime = LLONG_MAX;
+    maxPrime = LLONG_MIN;
+
+    long long num = 0;
+    bool reading = false;
+
+    for (char c : content)
+    {
+        if (isdigit((unsigned char)c))
+        {
+            num = num * 10 + (c - '0');
+            reading = true;
+        }
+        else if (reading)
+        {
+            if (isPrime(num))
+            {
+                if (num < minPrime) minPrime = num;
+                if (num > maxPrime) maxPrime = num;
+            }
+            num = 0;
+            reading = false;
+        }
+    }
+
+    if (reading && isPrime(num))
+    {
+        if (num < minPrime) minPrime = num;
+        if (num > maxPrime) maxPrime = num;
+    }
+
+    return true;
+}
+
+int runWorker(const string& mapName, const string& mutexName, const string& semName)
 {
     HANDLE hMap = OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, mapName.c_str());
     HANDLE hMutex = OpenMutexA(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, mutexName.c_str());
     HANDLE hSem = OpenSemaphoreA(SYNCHRONIZE, FALSE, semName.c_str());
 
-    if (!hMap)
+    if (!hMap || !hMutex || !hSem)
     {
-        cout << "Worker map open error, GetLastError = " << GetLastError() << endl;
+        cout << "Worker open object error, GetLastError = " << GetLastError() << endl;
         return 1;
     }
 
-    if (!hMutex)
-    {
-        cout << "Worker mutex open error, GetLastError = " << GetLastError() << endl;
-        return 1;
-    }
+    SharedData* data = (SharedData*)MapViewOfFile(
+        hMap, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(SharedData));
 
-    if (!hSem)
-    {
-        cout << "Worker semaphore open error, GetLastError = " << GetLastError() << endl;
-        return 1;
-    }
-
-    SharedData* data = (SharedData*)MapViewOfFile(hMap, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(SharedData));
     if (!data)
     {
         cout << "Worker map view error, GetLastError = " << GetLastError() << endl;
@@ -168,35 +232,47 @@ int runWorker(string mapName, string mutexName, string semName)
 
     SafeQueue queue(hMutex, hSem, data);
 
-    // Find out how many files there are (from main, pass as argument or use filesProcessed)
-    int fileCount = data->filesProcessed;
-    vector<long long> fileMinPrimes(fileCount, LLONG_MAX);
-    vector<long long> fileMaxPrimes(fileCount, LLONG_MIN);
-
     QueueItem item;
     while (queue.pop(item))
     {
-        if (isPrime(item.value))
+        int idx = item.fileIndex;
+        if (idx < 0 || idx >= data->totalFiles)
+            continue;
+
+        long long localMin = LLONG_MAX;
+        long long localMax = LLONG_MIN;
+
+        bool ok = processOneFile(data->filePaths[idx], localMin, localMax);
+
+        WaitForSingleObject(hMutex, INFINITE);
+
+        if (!ok)
         {
-            int idx = item.fileIndex;
-            if (idx >= 0 && idx < fileCount) {
-                if (item.value < fileMinPrimes[idx]) fileMinPrimes[idx] = item.value;
-                if (item.value > fileMaxPrimes[idx]) fileMaxPrimes[idx] = item.value;
-            }
-            WaitForSingleObject(hMutex, INFINITE);
-            if (item.value < data->globalMin) data->globalMin = item.value;
-            if (item.value > data->globalMax) data->globalMax = item.value;
-            ReleaseMutex(hMutex);
+            data->fileMinPrime[idx] = LLONG_MAX;
+            data->fileMaxPrime[idx] = LLONG_MIN;
         }
+        else
+        {
+            data->fileMinPrime[idx] = localMin;
+            data->fileMaxPrime[idx] = localMax;
+
+            if (localMin != LLONG_MAX && localMin < data->globalMin)
+                data->globalMin = localMin;
+            if (localMax != LLONG_MIN && localMax > data->globalMax)
+                data->globalMax = localMax;
+        }
+
+        ReleaseMutex(hMutex);
     }
 
-    // Workers only update stats, do not print per-file results
-    // Remove per-file printing from worker
-    // (after queue processing loop)
+    UnmapViewOfFile(data);
+    CloseHandle(hMap);
+    CloseHandle(hMutex);
+    CloseHandle(hSem);
+
     return 0;
 }
 
-// ================= SPAWN WORKER =================
 HANDLE spawnWorker()
 {
     wchar_t exePath[MAX_PATH];
@@ -210,7 +286,7 @@ HANDLE spawnWorker()
     if (!CreateProcessW(NULL, (LPWSTR)cmd.c_str(),
         NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi))
     {
-        cout << "Failed to create worker\n";
+        cout << "Failed to create worker" << endl;
         return NULL;
     }
 
@@ -218,22 +294,22 @@ HANDLE spawnWorker()
     return pi.hProcess;
 }
 
-// ================= MAIN =================
 int main(int argc, char* argv[])
 {
     string mapName = "Local\\MyMap";
     string mutexName = "Local\\MyMutex";
     string semName = "Local\\MySem";
+
+    if (argc == 2 && string(argv[1]) == "--worker")
+    {
+        return runWorker(mapName, mutexName, semName);
+    }
+
     string inputDir = ".";
     int workerCount = 0;
 
-    // WORKER MODE
-    if (argc == 2 && string(argv[1]) == "--worker")
-        return runWorker(mapName, mutexName, semName);
-
     if (argc >= 2)
         inputDir = argv[1];
-
     if (argc >= 3)
         workerCount = atoi(argv[2]);
 
@@ -245,7 +321,7 @@ int main(int argc, char* argv[])
 
     if (workerCount <= 0)
     {
-        cout << "Invalid worker count\n";
+        cout << "Invalid worker count" << endl;
         return 1;
     }
 
@@ -256,12 +332,27 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    // ================= INIT SHARED =================
+    vector<string> txtFiles;
+    collectTxtFilesRecursive(inputDir, txtFiles);
+
+    if (txtFiles.empty())
+    {
+        cout << "No .txt files found in: " << inputDir << endl;
+        return 1;
+    }
+
+    if (txtFiles.size() > MAX_FILES)
+    {
+        cout << "Too many files. Max supported: " << MAX_FILES << endl;
+        return 1;
+    }
+
     HANDLE hMap = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL,
         PAGE_READWRITE, 0, sizeof(SharedData), mapName.c_str());
 
-    if (!hMap) {
-        cout << "Memory error, GetLastError = " << GetLastError() << endl;
+    if (!hMap)
+    {
+        cout << "Memory mapping error, GetLastError = " << GetLastError() << endl;
         return 1;
     }
 
@@ -271,14 +362,9 @@ int main(int argc, char* argv[])
     if (!data)
     {
         cout << "MapViewOfFile error, GetLastError = " << GetLastError() << endl;
+        CloseHandle(hMap);
         return 1;
     }
-
-    data->head = data->tail = 0;
-    data->done = false;
-    data->globalMin = LLONG_MAX;
-    data->globalMax = LLONG_MIN;
-    data->filesProcessed = 0;
 
     HANDLE hMutex = CreateMutexA(NULL, FALSE, mutexName.c_str());
     HANDLE hSem = CreateSemaphoreA(NULL, 0, MAX_QUEUE, semName.c_str());
@@ -286,28 +372,33 @@ int main(int argc, char* argv[])
     if (!hMutex || !hSem)
     {
         cout << "Sync object creation error, GetLastError = " << GetLastError() << endl;
+        UnmapViewOfFile(data);
+        CloseHandle(hMap);
         return 1;
+    }
+
+    data->head = 0;
+    data->tail = 0;
+    data->count = 0;
+    data->done = false;
+    data->totalFiles = (int)txtFiles.size();
+    data->globalMin = LLONG_MAX;
+    data->globalMax = LLONG_MIN;
+
+    for (int i = 0; i < data->totalFiles; i++)
+    {
+        ZeroMemory(data->filePaths[i], MAX_PATH_LEN);
+        strncpy(data->filePaths[i], txtFiles[i].c_str(), MAX_PATH_LEN - 1);
+        data->filePaths[i][MAX_PATH_LEN - 1] = '\0';
+        data->fileMinPrime[i] = LLONG_MAX;
+        data->fileMaxPrime[i] = LLONG_MIN;
     }
 
     SafeQueue queue(hMutex, hSem, data);
 
-    // ================= PRODUCER =================
-    vector<string> txtFiles;
-    collectTxtFilesRecursive(inputDir, txtFiles);
-
-    if (txtFiles.empty())
-    {
-        cout << "No files found in: " << inputDir << endl;
-        return 1;
-    }
-
     cout << "Found " << txtFiles.size() << " txt files" << endl;
     cout << "Using " << workerCount << " workers" << endl;
 
-    long long overallMinPrime = LLONG_MAX;
-    long long overallMaxPrime = LLONG_MIN;
-
-    // ================= START WORKERS =================
     vector<HANDLE> workers;
     for (int i = 0; i < workerCount; i++)
     {
@@ -320,120 +411,60 @@ int main(int argc, char* argv[])
         workers.push_back(hWorker);
     }
 
-    cout << "\nType '+' to add a worker, '-' to remove a worker, or 'q' to finish file processing." << endl;
-    int fileIndex = 0;
-    bool quitRequested = false;
-    for (const string& filePath : txtFiles)
+    for (int i = 0; i < data->totalFiles; i++)
     {
-        // Handle user input before processing each file
-        if (_kbhit()) {
-            string cmd;
-            getline(cin, cmd);
-            if (cmd == "+") {
-                HANDLE hWorker = spawnWorker();
-                if (hWorker) {
-                    workers.push_back(hWorker);
-                    cout << "Worker added. Total: " << workers.size() << endl;
-                    ReleaseSemaphore(hSem, 1, NULL);
-                } else {
-                    cout << "Failed to add worker." << endl;
-                }
-            } else if (cmd == "-") {
-                if (!workers.empty()) {
-                    HANDLE h = workers.back();
-                    TerminateProcess(h, 0);
-                    CloseHandle(h);
-                    workers.pop_back();
-                    cout << "Worker removed. Total: " << workers.size() << endl;
-                } else {
-                    cout << "No workers to remove." << endl;
-                }
-            } else if (cmd == "q") {
-                quitRequested = true;
-                break;
-            }
-        }
-        fileIndex++;
-        HANDLE hFile = CreateFileA(filePath.c_str(), GENERIC_READ,
-            FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hFile == INVALID_HANDLE_VALUE) continue;
-        char buffer[1024];
-        DWORD bytesRead;
-        string content;
-        while (ReadFile(hFile, buffer, sizeof(buffer), &bytesRead, NULL) && bytesRead > 0)
-            content.append(buffer, bytesRead);
-        CloseHandle(hFile);
-        long long num = 0;
-        bool reading = false;
-        long long fileMinPrime = LLONG_MAX;
-        long long fileMaxPrime = LLONG_MIN;
-        for (char c : content)
+        if (!queue.push({ i }))
         {
-            if (isdigit((unsigned char)c))
-            {
-                num = num * 10 + (c - '0');
-                reading = true;
-            }
-            else if (reading)
-            {
-                queue.push({num, fileIndex});
-                if (isPrime(num))
-                {
-                    if (num < fileMinPrime) fileMinPrime = num;
-                    if (num > fileMaxPrime) fileMaxPrime = num;
-                }
-                num = 0;
-                reading = false;
-            }
+            cout << "Queue overflow while scheduling files." << endl;
+            break;
         }
-        if (reading)
-        {
-            queue.push({num, fileIndex});
-            if (isPrime(num))
-            {
-                if (num < fileMinPrime) fileMinPrime = num;
-                if (num > fileMaxPrime) fileMaxPrime = num;
-            }
-        }
-        cout << "[FILE " << fileIndex << "/" << txtFiles.size() << "] "
-                 << fileNameOnly(filePath);
-        if (fileMinPrime == LLONG_MAX)
+    }
+
+ 
+    WaitForSingleObject(hMutex, INFINITE);
+    data->done = true;
+    ReleaseMutex(hMutex);
+
+    ReleaseSemaphore(hSem, (LONG)workers.size(), NULL);
+
+    for (HANDLE h : workers)
+    {
+        WaitForSingleObject(h, INFINITE);
+        CloseHandle(h);
+    }
+
+    cout << "\nPer-file prime stats:" << endl;
+    for (int i = 0; i < data->totalFiles; i++)
+    {
+        cout << "[FILE " << (i + 1) << "/" << data->totalFiles << "] "
+             << fileNameOnly(data->filePaths[i]);
+
+        if (data->fileMinPrime[i] == LLONG_MAX)
         {
             cout << " -> no primes found" << endl;
         }
         else
         {
-            cout << " -> min prime: " << fileMinPrime
-                 << ", max prime: " << fileMaxPrime << endl;
-            if (fileMinPrime < overallMinPrime) overallMinPrime = fileMinPrime;
-            if (fileMaxPrime > overallMaxPrime) overallMaxPrime = fileMaxPrime;
+            cout << " -> min prime: " << data->fileMinPrime[i]
+                 << ", max prime: " << data->fileMaxPrime[i] << endl;
         }
-        WaitForSingleObject(hMutex, INFINITE);
-        data->filesProcessed++;
-        ReleaseMutex(hMutex);
-        if (quitRequested) break;
     }
 
-    // ================= FINISH =================
-    WaitForSingleObject(hMutex, INFINITE);
-    data->done = true;
-    ReleaseMutex(hMutex);
-
-    ReleaseSemaphore(hSem, workers.size(), NULL);
-
-    // ================= WAIT =================
-    for (HANDLE h : workers)
-        WaitForSingleObject(h, INFINITE);
-
-    // ================= RESULT =================
-    cout << "Summary for all files:" << endl;
-    if (overallMinPrime == LLONG_MAX)
+    cout << "\nSummary for all files:" << endl;
+    if (data->globalMin == LLONG_MAX)
+    {
         cout << "No primes found" << endl;
+    }
     else
     {
-        cout << "Overall smallest prime: " << overallMinPrime << endl;
-        cout << "Overall biggest prime: " << overallMaxPrime << endl;
+        cout << "Overall smallest prime: " << data->globalMin << endl;
+        cout << "Overall biggest prime: " << data->globalMax << endl;
     }
+
+    UnmapViewOfFile(data);
+    CloseHandle(hMap);
+    CloseHandle(hMutex);
+    CloseHandle(hSem);
 
     return 0;
 }
