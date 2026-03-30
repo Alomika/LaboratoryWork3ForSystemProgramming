@@ -198,7 +198,7 @@ bool processOneFile(const char* filePath, long long& minPrime, long long& maxPri
     minPrime = LLONG_MAX;
     maxPrime = LLONG_MIN;
 
-    long long value = 0;
+    long long number = 0;
     bool readingNumber = false;
 
     char buf[4096];
@@ -210,18 +210,18 @@ bool processOneFile(const char* filePath, long long& minPrime, long long& maxPri
                 readingNumber = true;
                 const int digit = c - '0';
 
-                if (value > (LLONG_MAX - digit) / 10) {
+                if (number > (LLONG_MAX - digit) / 10) {
                     // Clamp on overflow; still treat it as a completed huge number.
-                    value = LLONG_MAX;
+                    number = LLONG_MAX;
                 } else {
-                    value = value * 10 + digit;
+                    number = number * 10 + digit;
                 }
             } else if (readingNumber) {
-                if (isPrime(value)) {
-                    if (value < minPrime) minPrime = value;
-                    if (value > maxPrime) maxPrime = value;
+                if (isPrime(number)) {
+                    if (number < minPrime) minPrime = number;
+                    if (number > maxPrime) maxPrime = number;
                 }
-                value = 0;
+                number = 0;
                 readingNumber = false;
             }
         }
@@ -229,9 +229,9 @@ bool processOneFile(const char* filePath, long long& minPrime, long long& maxPri
 
     CloseHandle(hFile);
 
-    if (readingNumber && isPrime(value)) {
-        if (value < minPrime) minPrime = value;
-        if (value > maxPrime) maxPrime = value;
+    if (readingNumber && isPrime(number)) {
+        if (number < minPrime) minPrime = number;
+        if (number > maxPrime) maxPrime = number;
     }
 
     return true;
@@ -328,7 +328,7 @@ HANDLE spawnWorker(int workerId, const string& mapName, const string& mutexName,
     wchar_t idBuf[32] = {};
     _snwprintf(idBuf, 31, L"%d", workerId);
 
-    wstring cmd =
+    wstring inputCommand =
         L"\"" + wstring(exePath) +
         L"\" --worker " +
         wstring(idBuf) +
@@ -337,7 +337,7 @@ HANDLE spawnWorker(int workerId, const string& mapName, const string& mutexName,
         L"\" \"" + semW +
         L"\"";
 
-    vector<wchar_t> mutableCmd(cmd.begin(), cmd.end());
+    vector<wchar_t> mutableCmd(inputCommand.begin(), inputCommand.end());
     mutableCmd.push_back(L'\0');
 
     STARTUPINFOW si = {};
@@ -392,19 +392,19 @@ int countActiveWorkers(const vector<WorkerEntry>& workers)
 
 DWORD WINAPI controlThreadProc(LPVOID param)
 {
-    ControlContext* ctx = (ControlContext*)param;
+    ControlContext* controlContext = (ControlContext*)param;
     HANDLE hInput = GetStdHandle(STD_INPUT_HANDLE);
 
     cout << "\nControls: '+' add worker, '-' remove worker, 'q' stop control thread (no Enter needed)\n";
 
-    while (!(*ctx->stopController)) {
+    while (!(*controlContext->stopController)) {
         if (hInput == INVALID_HANDLE_VALUE || hInput == NULL) {
             Sleep(50);
             continue;
         }
 
-        DWORD numEvents = 0;
-        if (!GetNumberOfConsoleInputEvents(hInput, &numEvents) || numEvents == 0) {
+        DWORD numberOfInpEvents = 0;
+        if (!GetNumberOfConsoleInputEvents(hInput, &numberOfInpEvents) || numberOfInpEvents == 0) {
             Sleep(25);
             continue;
         }
@@ -423,16 +423,16 @@ DWORD WINAPI controlThreadProc(LPVOID param)
             continue;
         }
 
-        const char cmd = record.Event.KeyEvent.uChar.AsciiChar;
+        const char inputCommand = record.Event.KeyEvent.uChar.AsciiChar;
 
-        if (cmd == '+') {
-            EnterCriticalSection(ctx->workersCs);
-            reapFinishedWorkers(*ctx->workers);
+        if (inputCommand == '+') {
+            EnterCriticalSection(controlContext->workersCs);
+            reapFinishedWorkers(*controlContext->workers);
 
             bool used[MAX_WORKERS] = {};
-            for (size_t i = 0; i < ctx->workers->size(); ++i) {
-                if ((*ctx->workers)[i].process != NULL && (*ctx->workers)[i].id >= 0 && (*ctx->workers)[i].id < MAX_WORKERS) {
-                    used[(*ctx->workers)[i].id] = true;
+            for (size_t i = 0; i < controlContext->workers->size(); ++i) {
+                if ((*controlContext->workers)[i].process != NULL && (*controlContext->workers)[i].id >= 0 && (*controlContext->workers)[i].id < MAX_WORKERS) {
+                    used[(*controlContext->workers)[i].id] = true;
                 }
             }
 
@@ -443,68 +443,68 @@ DWORD WINAPI controlThreadProc(LPVOID param)
                     break;
                 }
             }
-            LeaveCriticalSection(ctx->workersCs);
+            LeaveCriticalSection(controlContext->workersCs);
 
             if (freeId < 0) {
                 cout << "Cannot add worker: max reached\n";
                 continue;
             }
 
-            WaitForSingleObject(ctx->hMutex, INFINITE);
-            ctx->data->workerStopRequested[freeId] = false;
-            ReleaseMutex(ctx->hMutex);
+            WaitForSingleObject(controlContext->hMutex, INFINITE);
+            controlContext->data->workerStopRequested[freeId] = false;
+            ReleaseMutex(controlContext->hMutex);
 
-            HANDLE hProc = spawnWorker(freeId, ctx->mapName, ctx->mutexName, ctx->semName);
+            HANDLE hProc = spawnWorker(freeId, controlContext->mapName, controlContext->mutexName, controlContext->semName);
             if (!hProc) {
                 cout << "Failed to create new worker\n";
                 continue;
             }
 
-            EnterCriticalSection(ctx->workersCs);
-            ctx->workers->push_back({ freeId, hProc, false });
-            if (ctx->totalSpawned) {
-                ++(*ctx->totalSpawned);
+            EnterCriticalSection(controlContext->workersCs);
+            controlContext->workers->push_back({ freeId, hProc, false });
+            if (controlContext->totalSpawned) {
+                ++(*controlContext->totalSpawned);
             }
-            const int active = countActiveWorkers(*ctx->workers);
-            LeaveCriticalSection(ctx->workersCs);
+            const int active = countActiveWorkers(*controlContext->workers);
+            LeaveCriticalSection(controlContext->workersCs);
 
             cout << "Added worker " << freeId << ". Active workers: " << active << "\n";
-        } else if (cmd == '-') {
+        } else if (inputCommand == '-') {
             int selectedId = -1;
 
-            EnterCriticalSection(ctx->workersCs);
-            reapFinishedWorkers(*ctx->workers);
+            EnterCriticalSection(controlContext->workersCs);
+            reapFinishedWorkers(*controlContext->workers);
 
-            const int active = countActiveWorkers(*ctx->workers);
+            const int active = countActiveWorkers(*controlContext->workers);
             if (active <= 1) {
-                LeaveCriticalSection(ctx->workersCs);
+                LeaveCriticalSection(controlContext->workersCs);
                 cout << "Cannot remove last active worker\n";
                 continue;
             }
 
-            for (int i = (int)ctx->workers->size() - 1; i >= 0; --i) {
-                if ((*ctx->workers)[i].process != NULL && !(*ctx->workers)[i].stopRequested) {
-                    (*ctx->workers)[i].stopRequested = true;
-                    selectedId = (*ctx->workers)[i].id;
+            for (int i = (int)controlContext->workers->size() - 1; i >= 0; --i) {
+                if ((*controlContext->workers)[i].process != NULL && !(*controlContext->workers)[i].stopRequested) {
+                    (*controlContext->workers)[i].stopRequested = true;
+                    selectedId = (*controlContext->workers)[i].id;
                     break;
                 }
             }
-            LeaveCriticalSection(ctx->workersCs);
+            LeaveCriticalSection(controlContext->workersCs);
 
             if (selectedId < 0) {
                 cout << "No worker available for graceful removal\n";
                 continue;
             }
 
-            WaitForSingleObject(ctx->hMutex, INFINITE);
-            ctx->data->workerStopRequested[selectedId] = true;
-            ReleaseMutex(ctx->hMutex);
+            WaitForSingleObject(controlContext->hMutex, INFINITE);
+            controlContext->data->workerStopRequested[selectedId] = true;
+            ReleaseMutex(controlContext->hMutex);
 
             // Wake an idle worker so it can see stop flag and exit immediately.
-            ReleaseSemaphore(ctx->hSem, 1, NULL);
+            ReleaseSemaphore(controlContext->hSem, 1, NULL);
 
             cout << "Requested stop for worker " << selectedId << "\n";
-        } else if (cmd == 'q' || cmd == 'Q') {
+        } else if (inputCommand == 'q' || inputCommand == 'Q') {
             cout << "Control thread stopping on user request\n";
             break;
         }
@@ -548,8 +548,8 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    const DWORD attr = GetFileAttributesA(inputDir.c_str());
-    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+    const DWORD attributes = GetFileAttributesA(inputDir.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
         cout << "Directory not found: " << inputDir << "\n";
         return 1;
     }
@@ -662,19 +662,19 @@ int main(int argc, char* argv[])
     int totalSpawnedWorkers = initialWorkers;
 
     bool stopController = false;
-    ControlContext ctx = {};
-    ctx.hMutex = hMutex;
-    ctx.hSem = hSem;
-    ctx.data = data;
-    ctx.workers = &workers;
-    ctx.workersCs = &workersCs;
-    ctx.stopController = &stopController;
-    ctx.mapName = mapName;
-    ctx.mutexName = mutexName;
-    ctx.semName = semName;
-    ctx.totalSpawned = &totalSpawnedWorkers;
+    ControlContext controlContext = {};
+    controlContext.hMutex = hMutex;
+    controlContext.hSem = hSem;
+    controlContext.data = data;
+    controlContext.workers = &workers;
+    controlContext.workersCs = &workersCs;
+    controlContext.stopController = &stopController;
+    controlContext.mapName = mapName;
+    controlContext.mutexName = mutexName;
+    controlContext.semName = semName;
+    controlContext.totalSpawned = &totalSpawnedWorkers;
 
-    HANDLE hControlThread = CreateThread(NULL, 0, controlThreadProc, &ctx, 0, NULL);
+    HANDLE hControlThread = CreateThread(NULL, 0, controlThreadProc, &controlContext, 0, NULL);
     if (!hControlThread) {
         cout << "Failed to start control thread\n";
         stopController = true;
