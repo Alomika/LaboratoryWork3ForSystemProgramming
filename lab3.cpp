@@ -11,9 +11,9 @@
 
 using namespace std;
 
-#define MAX_QUEUE 100000
-#define MAX_FILES 4096
-#define MAX_PATH_LEN 260
+#define MAX_IN_LINE 100000
+#define MAX_ITEMS 4096
+#define MAX_DIR_SIZE 260
 #define MAX_WORKERS 256
 
 struct QueueItem {
@@ -21,16 +21,16 @@ struct QueueItem {
 };
 
 struct SharedData {
-    QueueItem queue[MAX_QUEUE];
+    QueueItem queue[MAX_IN_LINE];
     int head;
     int tail;
     int count;
     bool done;
 
     int totalFiles;
-    char filePaths[MAX_FILES][MAX_PATH_LEN];
-    long long fileMinPrime[MAX_FILES];
-    long long fileMaxPrime[MAX_FILES];
+    char filePaths[MAX_ITEMS][MAX_DIR_SIZE];
+    long long fileMinPrime[MAX_ITEMS];
+    long long fileMaxPrime[MAX_ITEMS];
 
     long long globalMin;
     long long globalMax;
@@ -66,13 +66,13 @@ public:
     {
         WaitForSingleObject(hMutex, INFINITE);
 
-        if (data->count >= MAX_QUEUE) {
+        if (data->count >= MAX_IN_LINE) {
             ReleaseMutex(hMutex);
             return false;
         }
 
         data->queue[data->tail] = item;
-        data->tail = (data->tail + 1) % MAX_QUEUE;
+        data->tail = (data->tail + 1) % MAX_IN_LINE;
         data->count++;
 
         ReleaseMutex(hMutex);
@@ -100,7 +100,7 @@ public:
 
             if (data->count > 0) {
                 out = data->queue[data->head];
-                data->head = (data->head + 1) % MAX_QUEUE;
+                data->head = (data->head + 1) % MAX_IN_LINE;
                 data->count--;
                 ReleaseMutex(hMutex);
                 return true;
@@ -562,8 +562,8 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    if (files.size() > MAX_FILES) {
-        cout << "Too many files (max " << MAX_FILES << ")\n";
+    if (files.size() > MAX_ITEMS) {
+        cout << "Too many files (max " << MAX_ITEMS << ")\n";
         return 1;
     }
 
@@ -606,7 +606,7 @@ int main(int argc, char* argv[])
     }
 
     HANDLE hMutex = CreateMutexA(NULL, FALSE, mutexName.c_str());
-    HANDLE hSem = CreateSemaphoreA(NULL, 0, MAX_QUEUE, semName.c_str());
+    HANDLE hSem = CreateSemaphoreA(NULL, 0, MAX_IN_LINE, semName.c_str());
 
     if (!hMutex || !hSem) {
         cout << "Failed to create synchronization objects. GetLastError=" << GetLastError() << "\n";
@@ -627,9 +627,9 @@ int main(int argc, char* argv[])
     data->globalMax = LLONG_MIN;
 
     for (int i = 0; i < data->totalFiles; ++i) {
-        ZeroMemory(data->filePaths[i], MAX_PATH_LEN);
-        strncpy(data->filePaths[i], files[i].c_str(), MAX_PATH_LEN - 1);
-        data->filePaths[i][MAX_PATH_LEN - 1] = '\0';
+        ZeroMemory(data->filePaths[i], MAX_DIR_SIZE);
+        strncpy(data->filePaths[i], files[i].c_str(), MAX_DIR_SIZE - 1);
+        data->filePaths[i][MAX_DIR_SIZE - 1] = '\0';
         data->fileMinPrime[i] = LLONG_MAX;
         data->fileMaxPrime[i] = LLONG_MIN;
     }
